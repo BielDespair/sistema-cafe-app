@@ -54,9 +54,16 @@ class ProductUpdate(ProductBase):
 
 class ProductOut(ProductBase):
     id: int
+    image_url: Optional[str] = None
 
 
 # ---------------- Entradas ----------------
+
+class EntradaUpdate(CamelModel):
+    date: str
+    quantity: int = Field(gt=0)
+    unit_cost: float = Field(ge=0)
+
 
 class EntradaCreate(CamelModel):
     date: str
@@ -73,6 +80,7 @@ class EntradaOut(CamelModel):
     quantity: int
     unit_cost: float
     total_cost: float
+    pode_editar: bool
 
 
 # ---------------- Clientes / Dívidas ----------------
@@ -136,8 +144,15 @@ class VendaCreate(CamelModel):
     delivery_status: Literal["ENTREGUE", "PENDENTE"]
 
 
-class VendaItemOut(VendaItemIn):
+class VendaItemOut(CamelModel):
     id: int
+    product_id: int
+    product_name: str
+    quantity: int
+    unit_price: float
+    total_price: float
+    unit_cost: float
+    profit: float
 
 
 class VendaOut(CamelModel):
@@ -160,3 +175,70 @@ class CepOut(CamelModel):
     bairro: str
     localidade: str
     uf: str
+
+
+# ---------------- Dashboard ----------------
+
+class DashboardSummary(CamelModel):
+    start_date: str
+    end_date: str
+    revenue: float
+    cost: float
+    profit: float
+    sales_count: int
+    units_sold: int
+    average_ticket: float
+
+
+class LowStockProduct(CamelModel):
+    id: int
+    name: str
+    sku: str
+    stock: int
+    sell_price: float
+    status: Literal["SEM_ESTOQUE", "BAIXO"]
+
+
+class DevedorOut(CamelModel):
+    id: int
+    name: str
+    phone: str
+    notes: str = ""
+    total_debt: float
+    oldest_debt_date: Optional[str] = None
+    debts: List[DebtOut] = []
+
+
+class ProfitPoint(CamelModel):
+    label: str
+    revenue: float
+    cost: float
+    profit: float
+
+
+class EntregaPendenteOut(CamelModel):
+    id: int
+    date: str
+    client_id: Optional[int] = None
+    client_name: str
+    client_phone: str = ""
+    total_value: float
+    items_summary: str
+
+
+class TopClienteOut(CamelModel):
+    id: int
+    name: str
+    phone: str
+    notes: str = ""
+    total_comprado: float
+    quantidade_compras: int
+    ultima_compra: Optional[str] = None
+
+
+class TopProdutoOut(CamelModel):
+    product_id: int
+    product_name: str
+    quantidade_vendida: int
+    faturamento: float
+    lucro: float

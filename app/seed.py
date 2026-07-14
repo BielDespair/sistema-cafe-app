@@ -3,9 +3,6 @@ from .database import SessionLocal
 
 
 def run() -> None:
-    """Popula dados iniciais (usuário admin + exemplos) se o banco estiver vazio.
-    Seguro para chamar em todo startup: só insere se as tabelas estiverem vazias.
-    """
     db = SessionLocal()
     try:
         if not db.query(models.User).first():
@@ -16,35 +13,40 @@ def run() -> None:
             ))
 
         if not db.query(models.Product).first():
-            db.add_all([
-                models.Product(name="Óleo de Motor 5W30", sku="OL-5W30", cost_price=25.00, sell_price=45.90, stock=120),
-                models.Product(name="Filtro de Ar", sku="FIL-AR-01", cost_price=12.00, sell_price=25.50, stock=5),
-                models.Product(name="Pastilha de Freio", sku="FRE-PAS-09", cost_price=60.00, sell_price=110.00, stock=34),
-            ])
+            seed_products = [
+                ("Café Especial 250g Grão", "CE-250-GRAO", 12.00, 22.90, 40),
+                ("Café Especial 250g Pó", "CE-250-PO", 11.50, 21.90, 35),
+                ("Café Gourmet 500g", "CG-500", 18.00, 32.90, 25),
+                ("Café Tradicional 500g", "CT-500", 9.00, 16.90, 60),
+            ]
+            for name, sku, cost, sell, stock in seed_products:
+                product = models.Product(name=name, sku=sku, cost_price=cost, sell_price=sell, stock=stock)
+                db.add(product)
+                db.flush()
+                db.add(models.StockLot(
+                    product_id=product.id,
+                    entrada_id=None,
+                    date="2026-01-01",
+                    quantity_received=stock,
+                    quantity_remaining=stock,
+                    unit_cost=cost,
+                ))
 
         if not db.query(models.Client).first():
             client = models.Client(
-                name="Roberto Silva",
-                document="111.222.333-44",
-                phone="(11) 99999-9999",
-                email="roberto@email.com",
-                pix="roberto@email.com",
-                zip_code="01001-000",
-                address="Praça da Sé",
-                number="123",
-                neighborhood="Centro",
-                city="São Paulo",
-                state="SP",
+                name="Roberto Silva", document="111.222.333-44", phone="(11) 99999-9999",
+                email="roberto@email.com", pix="roberto@email.com", zip_code="01001-000",
+                address="Praça da Sé", number="123", neighborhood="Centro", city="São Paulo", state="SP",
                 notes="Cliente antigo. Paga sempre no dia 10.",
             )
             db.add(client)
-            db.flush()  # garante client.id sem precisar de commit
+            db.flush()
 
             db.add_all([
-                models.Debt(client_id=client.id, date="10/07/2026", product_name="Óleo de Motor 5W30",
-                            quantity=1, unit_price=45.00, total_price=45.00),
-                models.Debt(client_id=client.id, date="12/07/2026", product_name="Filtro de Ar",
-                            quantity=1, unit_price=20.00, total_price=20.00),
+                models.Debt(client_id=client.id, date="10/07/2026", product_name="Café Especial 250g Grão",
+                            quantity=1, unit_price=22.90, total_price=22.90),
+                models.Debt(client_id=client.id, date="12/07/2026", product_name="Café Tradicional 500g",
+                            quantity=1, unit_price=16.90, total_price=16.90),
             ])
 
         db.commit()
