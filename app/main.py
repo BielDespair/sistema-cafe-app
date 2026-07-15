@@ -5,15 +5,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import seed
-from .database import Base, engine
 from .routers import auth, cep, clients, dashboard, entradas, products, vendas
 
-Base.metadata.create_all(bind=engine)
+# Nada de Base.metadata.create_all() aqui — desde que o Alembic entrou,
+# quem cria/atualiza as tabelas é ele (`alembic upgrade head`), rodado antes
+# da API subir (veja o Start Command no Render). Ter os dois mexendo no
+# schema ao mesmo tempo é receita pra inconsistência.
 
 app = FastAPI(
     title="Controle de Estoque API",
     description="API para o sistema de vendas, estoque, clientes e entradas.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 allowed_origins = os.getenv(
@@ -41,6 +43,10 @@ app.include_router(vendas.router)
 app.include_router(cep.router)
 app.include_router(dashboard.router)
 
+# O seed continua rodando no startup — ele só insere dados de exemplo se as
+# tabelas estiverem vazias, então é seguro mesmo com o schema vindo do Alembic
+# (as tabelas já existem quando a API sobe, graças ao `alembic upgrade head`
+# rodado antes).
 seed.run()
 
 
