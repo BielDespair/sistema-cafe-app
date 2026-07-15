@@ -1,11 +1,19 @@
 from datetime import date
+from pathlib import Path
+import shutil
 from typing import List
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, security
 from ..database import get_db
+
+
+UPLOAD_DIR = Path("uploads/products")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 
 router = APIRouter(
     prefix="/products",
@@ -103,3 +111,49 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
 
     db.delete(product)
     db.commit()
+
+
+@router.post("/{product_id}/imagem", response_model=schemas.ProductOut)
+def upload_product_image(
+    product_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    product = (
+        db.query(models.Product)
+        .filter(models.Product.id == product_id)
+        .first()
+    )
+
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail="Produto não encontrado."
+        )
+
+    allowed_types = {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail="Formato de imagem inválido."
+        )
+
+    extension = Path(file.filename).suffix.lower()
+    filename = f"{uuid.uuid4()}{extension}"
+
+    filepath = UPLOAD_DIR / filename
+
+    with filepath.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    product.image_url = f"/uploads/products/{filename}"
+
+    db.commit()
+    db.refresh(product)
+
+    return product
