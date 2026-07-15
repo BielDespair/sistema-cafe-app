@@ -1,17 +1,82 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session, joinedload
 
 from .. import models, schemas, security
 from ..database import get_db
-from ..stock_utils import recalculate_average_cost
 
 router = APIRouter(
     prefix="/vendas",
     tags=["Vendas"],
     dependencies=[Depends(security.get_current_user)],
 )
+
+
+def _allocate_from_lots(
+    db: Session, product: models.Product, quantity_needed: int
+) -> List[Tuple[models.StockLot, int]]:
+    """Planeja quais lotes (mais antigos primeiro) cobrem `quantity_needed`
+    unidades. NÃO grava nada e NUNCA inventa custo — se os lotes disponíveis
+    não cobrirem tudo, o plano simplesmente vem menor que o pedido, e quem
+    chama decide o que fazer com a parte não coberta (vira venda sob
+    encomenda, pendente de custo)."""
+    lots = (
+        db.query(models.StockLot)
+        .filter(models.StockLot.product_id == product.id, models.StockLot.quantity_remaining > 0)
+        .order_by(models.StockLot.date.asc(), models.StockLot.id.asc())
+        .all()
+    )
+
+    plano: List[Tuple[models.StockLot, int]] = []
+    faltando = quantity_needed
+    for lot in lots:
+        if faltando <= 0:
+            break
+        consumida = min(lot.quantity_remaining, faltando)
+        if consumida > 0:
+            plano.append((lot, consumida))
+            faltando -= consumida
+
+    return plano
+
+
+def _aplicar_alocacoes(
+    db: Session,
+    venda_item: models.VendaItem,
+    plano: List[Tuple[models.StockLot, int]],
+    data: str,
+) -> None:
+    """Executa o plano de alocação: reduz o saldo dos lotes, cria os registros
+    de StockAllocation (anexados à *coleção* do item, não só gravados via FK
+    solta — isso mantém `venda_item.allocations` correto em memória sem
+    precisar de um refresh) e recalcula o status/custo/lucro do item."""
+    alocado_agora = 0
+    for lot, consumida in plano:
+        lot.quantity_remaining -= consumida
+        venda_item.allocations.append(models.StockAllocation(
+            stock_lot_id=lot.id,
+            quantity=consumida,
+            unit_cost=lot.unit_cost,
+            date=data,
+        ))
+        alocado_agora += consumida
+
+    venda_item.quantity_allocated += alocado_agora
+
+    if venda_item.quantity_allocated >= venda_item.quantity:
+        total_custo = sum(a.quantity * a.unit_cost for a in venda_item.allocations)
+        venda_item.unit_cost = round(total_custo / venda_item.quantity, 4)
+        venda_item.profit = round(venda_item.total_price - total_custo, 2)
+        venda_item.cost_status = "COMPLETO"
+    elif venda_item.quantity_allocated > 0:
+        venda_item.cost_status = "PARCIAL"
+        venda_item.unit_cost = None
+        venda_item.profit = None
+    else:
+        venda_item.cost_status = "PENDENTE"
+        venda_item.unit_cost = None
+        venda_item.profit = None
 
 
 @router.get("", response_model=List[schemas.VendaOut])
@@ -31,32 +96,6 @@ def list_vendas(
         query = query.filter(models.Venda.client_id == client_id)
 
     return query.order_by(models.Venda.date.desc(), models.Venda.id.desc()).all()
-def _consume_fifo(db: Session, product: models.Product, quantity: int) -> float:
-    remaining = quantity
-    total_cost = 0.0
-
-    lots = (
-        db.query(models.StockLot)
-        .filter(models.StockLot.product_id == product.id, models.StockLot.quantity_remaining > 0)
-        .order_by(models.StockLot.date.asc(), models.StockLot.id.asc())
-        .all()
-    )
-
-    for lot in lots:
-        if remaining <= 0:
-            break
-        consumed = min(lot.quantity_remaining, remaining)
-        lot.quantity_remaining -= consumed
-        total_cost += consumed * lot.unit_cost
-        remaining -= consumed
-
-    if remaining > 0:
-        total_cost += remaining * product.cost_price
-
-    return total_cost
-
-
-
 
 
 @router.post("", response_model=schemas.VendaOut, status_code=status.HTTP_201_CREATED)
@@ -77,32 +116,32 @@ def registrar_venda(payload: schemas.VendaCreate, db: Session = Depends(get_db))
         db.add(venda)
         db.flush()
 
-        for item in payload.items:
-            product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+        for item_in in payload.items:
+            venda_item = models.VendaItem(
+                venda_id=venda.id, product_id=item_in.product_id, product_name=item_in.product_name,
+                quantity=item_in.quantity, unit_price=item_in.unit_price, total_price=item_in.total_price,
+            )
+            db.add(venda_item)
+            db.flush()
 
-            item_cost = 0.0
+            product = db.query(models.Product).filter(models.Product.id == item_in.product_id).first()
             if product:
-                item_cost = _consume_fifo(db, product, item.quantity)
-                product.stock -= item.quantity
-                db.flush()
-                recalculate_average_cost(product, db)
+                # Estoque continua podendo ficar negativo — é o sinal de "venda sob
+                # encomenda" que o app já usava, sem mudança nesse comportamento.
+                product.stock -= item_in.quantity
 
-            unit_cost = (item_cost / item.quantity) if item.quantity else 0.0
-            profit = item.total_price - item_cost
-
-            db.add(models.VendaItem(
-                venda_id=venda.id, product_id=item.product_id, product_name=item.product_name,
-                quantity=item.quantity, unit_price=item.unit_price, total_price=item.total_price,
-                unit_cost=round(unit_cost, 4), profit=round(profit, 2),
-            ))
+                plano = _allocate_from_lots(db, product, item_in.quantity)
+                _aplicar_alocacoes(db, venda_item, plano, payload.date)
+            # Se o produto não existe mais (não deveria acontecer), o item fica
+            # como PENDENTE — nunca inventamos custo.
 
         if not payload.is_paid and payload.client_id:
             client = db.query(models.Client).filter(models.Client.id == payload.client_id).first()
             if client:
-                for item in payload.items:
+                for item_in in payload.items:
                     db.add(models.Debt(
-                        client_id=client.id, date=payload.date, product_name=item.product_name,
-                        quantity=item.quantity, unit_price=item.unit_price, total_price=item.total_price,
+                        client_id=client.id, date=payload.date, product_name=item_in.product_name,
+                        quantity=item_in.quantity, unit_price=item_in.unit_price, total_price=item_in.total_price,
                     ))
 
         db.commit()

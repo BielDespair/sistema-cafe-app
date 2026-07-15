@@ -1,3 +1,4 @@
+from datetime import date as date_type
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -6,6 +7,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas, security
 from ..database import get_db
 from ..stock_utils import recalculate_average_cost
+from .vendas import _aplicar_alocacoes
 
 router = APIRouter(
     prefix="/entradas",
@@ -23,6 +25,38 @@ def _to_out(db: Session, entrada: models.Entrada) -> schemas.EntradaOut:
         unit_cost=entrada.unit_cost, total_cost=entrada.total_cost,
         pode_editar=pode_editar,
     )
+
+
+def _reconciliar_pendentes(db: Session, product: models.Product, lot: models.StockLot) -> None:
+    """Quando um lote novo chega, primeiro quita o custo de vendas desse
+    produto que ficaram pendentes/parciais (venda sob encomenda) — a mais
+    antiga primeiro, mesmo critério de justiça do PEPS — antes de deixar o
+    saldo do lote livre para vendas futuras."""
+    pendentes = (
+        db.query(models.VendaItem)
+        .join(models.Venda)
+        .filter(
+            models.VendaItem.product_id == product.id,
+            models.VendaItem.cost_status != "COMPLETO",
+        )
+        .order_by(models.Venda.date.asc(), models.Venda.id.asc(), models.VendaItem.id.asc())
+        .all()
+    )
+
+    for item in pendentes:
+        if lot.quantity_remaining <= 0:
+            break
+
+        faltante = item.quantity - item.quantity_allocated
+        if faltante <= 0:
+            continue
+
+        consumida = min(faltante, lot.quantity_remaining)
+        if consumida <= 0:
+            continue
+
+        _aplicar_alocacoes(db, item, [(lot, consumida)], date_type.today().isoformat())
+        db.flush()
 
 
 @router.get("", response_model=List[schemas.EntradaOut])
@@ -46,11 +80,17 @@ def registrar_entrada(payload: schemas.EntradaCreate, db: Session = Depends(get_
     db.add(entrada)
     db.flush()
 
-    db.add(models.StockLot(
+    lot = models.StockLot(
         product_id=product.id, entrada_id=entrada.id, date=payload.date,
         quantity_received=payload.quantity, quantity_remaining=payload.quantity,
         unit_cost=payload.unit_cost,
-    ))
+    )
+    db.add(lot)
+    db.flush()
+
+    # Antes de contar esse estoque como "livre", quita vendas sob encomenda
+    # antigas desse produto que ainda estavam sem custo confirmado.
+    _reconciliar_pendentes(db, product, lot)
 
     product.stock += payload.quantity
     db.flush()
@@ -71,7 +111,7 @@ def editar_entrada(entrada_id: int, payload: schemas.EntradaUpdate, db: Session 
     if not lot or lot.quantity_remaining != lot.quantity_received:
         raise HTTPException(
             status_code=409,
-            detail="Essa entrada já teve produto vendido e não pode mais ser editada. "
+            detail="Essa entrada já teve produto vendido/alocado e não pode mais ser editada. "
                    "Registre uma nova entrada para corrigir a diferença.",
         )
 
@@ -79,7 +119,6 @@ def editar_entrada(entrada_id: int, payload: schemas.EntradaUpdate, db: Session 
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado.")
 
-    # Desfaz o efeito da entrada antiga e aplica a corrigida
     product.stock -= entrada.quantity
 
     entrada.date = payload.date
@@ -95,6 +134,10 @@ def editar_entrada(entrada_id: int, payload: schemas.EntradaUpdate, db: Session 
     product.stock += payload.quantity
 
     db.flush()
+
+    # A entrada corrigida também pode agora cobrir vendas pendentes.
+    _reconciliar_pendentes(db, product, lot)
+
     recalculate_average_cost(product, db)
 
     db.commit()
@@ -112,7 +155,7 @@ def apagar_entrada(entrada_id: int, db: Session = Depends(get_db)):
     if not lot or lot.quantity_remaining != lot.quantity_received:
         raise HTTPException(
             status_code=409,
-            detail="Essa entrada já teve produto vendido e não pode mais ser apagada. "
+            detail="Essa entrada já teve produto vendido/alocado e não pode mais ser apagada. "
                    "Registre uma nova entrada para corrigir a diferença.",
         )
 

@@ -22,7 +22,7 @@ class Product(Base):
     cost_price = Column(Float, nullable=False, default=0)   # Custo médio — só para exibição/referência
     sell_price = Column(Float, nullable=False, default=0)
     stock = Column(Integer, nullable=False, default=0)      # Pode ficar negativo (venda sob encomenda)
-    image_url = Column(String, nullable=True)               # Caminho relativo, ex: /uploads/products/3-a1b2c3d4.jpg
+    image_url = Column(String, nullable=True)
 
     lots = relationship("StockLot", back_populates="product", cascade="all, delete-orphan")
 
@@ -31,9 +31,8 @@ class StockLot(Base):
     """Lote de estoque para custo PEPS/FIFO.
 
     Cada entrada (compra) ou estoque inicial de um produto vira um lote com
-    sua própria data e custo unitário. Ao vender, consumimos dos lotes mais
-    antigos primeiro (`date`/`id` crescente) — isso dá o lucro real de cada
-    venda, em vez de um custo médio que "mistura" preços de compras diferentes.
+    sua própria data e custo unitário. Vendas consomem dos lotes mais antigos
+    primeiro (`date`/`id` crescente) via StockAllocation — nunca diretamente.
     """
     __tablename__ = "stock_lots"
 
@@ -46,6 +45,30 @@ class StockLot(Base):
     unit_cost = Column(Float, nullable=False)
 
     product = relationship("Product", back_populates="lots")
+    allocations = relationship("StockAllocation", back_populates="stock_lot")
+
+
+class StockAllocation(Base):
+    """Registra qual lote (StockLot) cobriu qual parte de qual item de venda.
+
+    Existe pra suportar venda sob encomenda: uma StockAllocation só é criada
+    quando existe estoque de verdade cobrindo aquela quantidade — seja no
+    momento da venda (se já havia lote com saldo) ou depois, quando uma
+    entrada nova chega e "quita" o custo de uma venda que ficou pendente.
+    Uma linha de venda pode ter várias alocações (de lotes diferentes) até
+    ficar 100% coberta.
+    """
+    __tablename__ = "stock_allocations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    venda_item_id = Column(Integer, ForeignKey("venda_items.id"), nullable=False)
+    stock_lot_id = Column(Integer, ForeignKey("stock_lots.id"), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    unit_cost = Column(Float, nullable=False)   # custo do lote, congelado no momento da alocação
+    date = Column(String, nullable=False)       # quando a alocação ocorreu (pode ser bem depois da venda)
+
+    venda_item = relationship("VendaItem", back_populates="allocations")
+    stock_lot = relationship("StockLot", back_populates="allocations")
 
 
 class Client(Base):
@@ -119,9 +142,14 @@ class VendaItem(Base):
     product_id = Column(Integer, nullable=False)
     product_name = Column(String, nullable=False)
     quantity = Column(Integer, nullable=False)
-    unit_price = Column(Float, nullable=False)       # preço de venda (o que o cliente pagou)
+    unit_price = Column(Float, nullable=False)       # preço de venda (o que o cliente pagou/vai pagar)
     total_price = Column(Float, nullable=False)
-    unit_cost = Column(Float, nullable=False, default=0)   # custo PEPS aplicado nesta venda
-    profit = Column(Float, nullable=False, default=0)      # total_price - (unit_cost * quantity)
+
+    # --- Rastreamento de custo real via lotes (PEPS), suporta venda sob encomenda ---
+    quantity_allocated = Column(Integer, nullable=False, default=0)   # quanto já foi coberto por algum lote
+    cost_status = Column(String, nullable=False, default="PENDENTE")  # PENDENTE | PARCIAL | COMPLETO
+    unit_cost = Column(Float, nullable=True)   # só definitivo quando cost_status == "COMPLETO"
+    profit = Column(Float, nullable=True)      # idem
 
     venda = relationship("Venda", back_populates="items")
+    allocations = relationship("StockAllocation", back_populates="venda_item", cascade="all, delete-orphan")

@@ -151,8 +151,14 @@ class VendaItemOut(CamelModel):
     quantity: int
     unit_price: float
     total_price: float
-    unit_cost: float
-    profit: float
+
+    # Rastreamento de custo real via lotes PEPS — suporta venda sob encomenda.
+    # unit_cost/profit só vêm preenchidos quando cost_status == "COMPLETO";
+    # antes disso, o custo real ainda não existe e não deve ser inventado.
+    quantity_allocated: int
+    cost_status: Literal["PENDENTE", "PARCIAL", "COMPLETO"]
+    unit_cost: Optional[float] = None
+    profit: Optional[float] = None
 
 
 class VendaOut(CamelModel):
@@ -182,9 +188,10 @@ class CepOut(CamelModel):
 class DashboardSummary(CamelModel):
     start_date: str
     end_date: str
-    revenue: float
-    cost: float
-    profit: float
+    revenue: float               # faturamento bruto (toda venda, sempre real)
+    cost: float                  # custo PEPS confirmado (só itens com cost_status == "COMPLETO")
+    profit: float                # lucro confirmado (idem)
+    pending_cost_revenue: float  # valor de vendas cujo custo ainda não foi confirmado (aguardando reposição)
     sales_count: int
     units_sold: int
     average_ticket: float

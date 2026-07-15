@@ -25,7 +25,7 @@ def _resolve_period(preset: Optional[str], start: Optional[str], end: Optional[s
     if preset == "30d":
         return (today - timedelta(days=29)).isoformat(), today.isoformat()
     if preset == "this_week":
-        start_of_week = today - timedelta(days=today.weekday())  # segunda-feira
+        start_of_week = today - timedelta(days=today.weekday())
         return start_of_week.isoformat(), today.isoformat()
     if preset == "last_week":
         start_of_this_week = today - timedelta(days=today.weekday())
@@ -40,7 +40,7 @@ def _resolve_period(preset: Optional[str], start: Optional[str], end: Optional[s
         last_month_start = last_month_end.replace(day=1)
         return last_month_start.isoformat(), last_month_end.isoformat()
 
-    return today.isoformat(), today.isoformat()  # "today" ou preset desconhecido
+    return today.isoformat(), today.isoformat()
 
 
 def _last_n_days(n: int, today: date) -> List[str]:
@@ -77,11 +77,24 @@ def get_summary(
         .all()
     )
 
+    todos_itens = [item for v in vendas for item in v.items]
+    itens_completos = [i for i in todos_itens if i.cost_status == "COMPLETO"]
+    itens_pendentes = [i for i in todos_itens if i.cost_status != "COMPLETO"]
+
+    # Faturamento é sempre o valor real da venda (o cliente se comprometeu a
+    # pagar isso, independente de já sabermos o custo ou não).
     revenue = sum(v.total_value for v in vendas)
-    cost = sum(item.unit_cost * item.quantity for v in vendas for item in v.items)
-    units_sold = sum(item.quantity for v in vendas for item in v.items)
+
+    # Custo e lucro só contam o que já está confirmado (evita "inventar"
+    # lucro/prejuízo de vendas sob encomenda ainda sem custo real).
+    cost = sum(i.unit_cost * i.quantity for i in itens_completos)
+    profit = sum(i.profit for i in itens_completos)
+
+    # Mostrado separado no dashboard — nunca somado ao lucro.
+    pending_cost_revenue = sum(i.total_price for i in itens_pendentes)
+
+    units_sold = sum(item.quantity for item in todos_itens)
     sales_count = len(vendas)
-    profit = revenue - cost
     average_ticket = (revenue / sales_count) if sales_count else 0.0
 
     return schemas.DashboardSummary(
@@ -90,6 +103,7 @@ def get_summary(
         revenue=round(revenue, 2),
         cost=round(cost, 2),
         profit=round(profit, 2),
+        pending_cost_revenue=round(pending_cost_revenue, 2),
         sales_count=sales_count,
         units_sold=units_sold,
         average_ticket=round(average_ticket, 2),
@@ -113,45 +127,30 @@ def get_low_stock(threshold: int = Query(10, ge=0), db: Session = Depends(get_db
     ]
 
 
-@router.get("/profit-series", response_model=List[schemas.ProfitPoint])
-def get_profit_series(
-    preset: str = Query("30d", description="7d|30d|12m"),
-    db: Session = Depends(get_db),
-):
-    today = date.today()
-    group_by_month = preset == "12m"
+@router.get("/devedores", response_model=List[schemas.DevedorOut])
+def get_devedores(db: Session = Depends(get_db)):
+    clients = db.query(models.Client).options(joinedload(models.Client.debts)).all()
 
-    if group_by_month:
-        labels = _last_n_months(12, today)
-        start_date = f"{labels[0]}-01"
-    else:
-        days = 7 if preset == "7d" else 30
-        labels = _last_n_days(days, today)
-        start_date = labels[0]
+    devedores = []
+    for c in clients:
+        total = sum(d.total_price for d in c.debts)
+        if total > 0:
+            oldest = min((d.date for d in c.debts), default=None)
+            devedores.append(schemas.DevedorOut(
+                id=c.id, name=c.name, phone=c.phone, notes=c.notes,
+                total_debt=round(total, 2), oldest_debt_date=oldest,
+                debts=[
+                    schemas.DebtOut(
+                        id=str(d.id), date=d.date, product_name=d.product_name,
+                        quantity=d.quantity, unit_price=d.unit_price, total_price=d.total_price,
+                    )
+                    for d in c.debts
+                ],
+            ))
 
-    vendas = (
-        db.query(models.Venda)
-        .options(joinedload(models.Venda.items))
-        .filter(models.Venda.date >= start_date)
-        .all()
-    )
+    devedores.sort(key=lambda d: d.total_debt, reverse=True)
+    return devedores
 
-    buckets = {label: {"revenue": 0.0, "cost": 0.0} for label in labels}
-    for v in vendas:
-        label = v.date[:7] if group_by_month else v.date
-        if label in buckets:
-            buckets[label]["revenue"] += v.total_value
-            buckets[label]["cost"] += sum(item.unit_cost * item.quantity for item in v.items)
-
-    return [
-        schemas.ProfitPoint(
-            label=label,
-            revenue=round(buckets[label]["revenue"], 2),
-            cost=round(buckets[label]["cost"], 2),
-            profit=round(buckets[label]["revenue"] - buckets[label]["cost"], 2),
-        )
-        for label in labels
-    ]
 
 @router.get("/entregas-pendentes", response_model=List[schemas.EntregaPendenteOut])
 def get_entregas_pendentes(db: Session = Depends(get_db)):
@@ -179,31 +178,6 @@ def get_entregas_pendentes(db: Session = Depends(get_db)):
         ))
 
     return result
-
-
-@router.get("/devedores", response_model=List[schemas.DevedorOut])
-def get_devedores(db: Session = Depends(get_db)):
-    clients = db.query(models.Client).options(joinedload(models.Client.debts)).all()
-
-    devedores = []
-    for c in clients:
-        total = sum(d.total_price for d in c.debts)
-        if total > 0:
-            oldest = min((d.date for d in c.debts), default=None)
-            devedores.append(schemas.DevedorOut(
-                id=c.id, name=c.name, phone=c.phone, notes=c.notes,
-                total_debt=round(total, 2), oldest_debt_date=oldest,
-                debts=[
-                    schemas.DebtOut(
-                        id=str(d.id), date=d.date, product_name=d.product_name,
-                        quantity=d.quantity, unit_price=d.unit_price, total_price=d.total_price,
-                    )
-                    for d in c.debts
-                ],
-            ))
-
-    devedores.sort(key=lambda d: d.total_debt, reverse=True)
-    return devedores
 
 
 @router.get("/top-clientes", response_model=List[schemas.TopClienteOut])
@@ -250,7 +224,10 @@ def get_top_produtos(limit: int = Query(10, ge=1, le=50), db: Session = Depends(
         )
         info["qty"] += item.quantity
         info["revenue"] += item.total_price
-        info["profit"] += item.profit
+        # Só soma lucro confirmado — itens ainda pendentes de custo entram no
+        # ranking de quantidade/faturamento normalmente, só não distorcem o lucro.
+        if item.cost_status == "COMPLETO" and item.profit is not None:
+            info["profit"] += item.profit
 
     ranking = [
         schemas.TopProdutoOut(
@@ -263,3 +240,53 @@ def get_top_produtos(limit: int = Query(10, ge=1, le=50), db: Session = Depends(
     ]
     ranking.sort(key=lambda r: r.quantidade_vendida, reverse=True)
     return ranking[:limit]
+
+
+@router.get("/profit-series", response_model=List[schemas.ProfitPoint])
+def get_profit_series(
+    preset: str = Query("30d", description="7d|30d|12m"),
+    db: Session = Depends(get_db),
+):
+    today = date.today()
+    group_by_month = preset == "12m"
+
+    if group_by_month:
+        labels = _last_n_months(12, today)
+        start_date = f"{labels[0]}-01"
+    else:
+        days = 7 if preset == "7d" else 30
+        labels = _last_n_days(days, today)
+        start_date = labels[0]
+
+    vendas = (
+        db.query(models.Venda)
+        .options(joinedload(models.Venda.items))
+        .filter(models.Venda.date >= start_date)
+        .all()
+    )
+
+    buckets = {label: {"revenue": 0.0, "cost": 0.0, "profit": 0.0} for label in labels}
+    for v in vendas:
+        label = v.date[:7] if group_by_month else v.date
+        if label not in buckets:
+            continue
+
+        buckets[label]["revenue"] += v.total_value  # faturamento bruto, sempre real
+
+        for item in v.items:
+            # Só soma custo/lucro de itens com custo já confirmado — senão o
+            # gráfico mostraria lucro maior do que existe de verdade em meses
+            # com venda sob encomenda ainda não reposta.
+            if item.cost_status == "COMPLETO" and item.unit_cost is not None and item.profit is not None:
+                buckets[label]["cost"] += item.unit_cost * item.quantity
+                buckets[label]["profit"] += item.profit
+
+    return [
+        schemas.ProfitPoint(
+            label=label,
+            revenue=round(buckets[label]["revenue"], 2),
+            cost=round(buckets[label]["cost"], 2),
+            profit=round(buckets[label]["profit"], 2),
+        )
+        for label in labels
+    ]
