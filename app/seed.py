@@ -5,13 +5,6 @@ from .database import SessionLocal
 def run() -> None:
     db = SessionLocal()
     try:
-        if not db.query(models.User).first():
-            db.add(models.User(
-                name="Administrador",
-                email="admin@sistema.com",
-                hashed_password=security.get_password_hash("123456"),
-            ))
-
         if not db.query(models.Product).first():
             seed_products = [
                 ("Café Especial 250g Grão", "CE-250-GRAO", 12.00, 22.90, 40),
