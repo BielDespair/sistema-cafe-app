@@ -7,10 +7,10 @@ def run() -> None:
     try:
         if not db.query(models.Product).first():
             seed_products = [
-                ("Café Especial 250g Grão", "CE-250-GRAO", 12.00, 22.90, 40),
-                ("Café Especial 250g Pó", "CE-250-PO", 11.50, 21.90, 35),
-                ("Café Gourmet 500g", "CG-500", 18.00, 32.90, 25),
-                ("Café Tradicional 500g", "CT-500", 9.00, 16.90, 60),
+                ("Café Especial 250g Grão", "CE-250-GRAO", 12.00, 22.90, 0),
+                ("Café Especial 250g Pó", "CE-250-PO", 11.50, 21.90, 0),
+                ("Café Gourmet 500g", "CG-500", 18.00, 32.90, 0),
+                ("Café Tradicional 500g", "CT-500", 9.00, 16.90, 0),
             ]
             for name, sku, cost, sell, stock in seed_products:
                 product = models.Product(name=name, sku=sku, cost_price=cost, sell_price=sell, stock=stock)

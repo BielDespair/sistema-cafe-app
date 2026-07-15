@@ -18,9 +18,7 @@ def _allocate_from_lots(
 ) -> List[Tuple[models.StockLot, int]]:
     """Planeja quais lotes (mais antigos primeiro) cobrem `quantity_needed`
     unidades. NÃO grava nada e NUNCA inventa custo — se os lotes disponíveis
-    não cobrirem tudo, o plano simplesmente vem menor que o pedido, e quem
-    chama decide o que fazer com a parte não coberta (vira venda sob
-    encomenda, pendente de custo)."""
+    não cobrirem tudo, o plano simplesmente vem menor que o pedido."""
     lots = (
         db.query(models.StockLot)
         .filter(models.StockLot.product_id == product.id, models.StockLot.quantity_remaining > 0)
@@ -41,29 +39,12 @@ def _allocate_from_lots(
     return plano
 
 
-def _aplicar_alocacoes(
-    db: Session,
-    venda_item: models.VendaItem,
-    plano: List[Tuple[models.StockLot, int]],
-    data: str,
-) -> None:
-    """Executa o plano de alocação: reduz o saldo dos lotes, cria os registros
-    de StockAllocation (anexados à *coleção* do item, não só gravados via FK
-    solta — isso mantém `venda_item.allocations` correto em memória sem
-    precisar de um refresh) e recalcula o status/custo/lucro do item."""
-    alocado_agora = 0
-    for lot, consumida in plano:
-        lot.quantity_remaining -= consumida
-        venda_item.allocations.append(models.StockAllocation(
-            stock_lot_id=lot.id,
-            quantity=consumida,
-            unit_cost=lot.unit_cost,
-            date=data,
-        ))
-        alocado_agora += consumida
-
-    venda_item.quantity_allocated += alocado_agora
-
+def _recalcular_item(venda_item: models.VendaItem) -> None:
+    """Recalcula cost_status/unit_cost/profit de um item de venda a partir
+    das alocações que ele tem HOJE. Chamada tanto quando uma venda nova é
+    registrada quanto quando o custo de um lote já usado é corrigido depois
+    (correção de erro de digitação numa entrada) — nesse segundo caso, o
+    lucro de vendas passadas é recalculado de propósito, não é bug."""
     if venda_item.quantity_allocated >= venda_item.quantity:
         total_custo = sum(a.quantity * a.unit_cost for a in venda_item.allocations)
         venda_item.unit_cost = round(total_custo / venda_item.quantity, 4)
@@ -77,6 +58,31 @@ def _aplicar_alocacoes(
         venda_item.cost_status = "PENDENTE"
         venda_item.unit_cost = None
         venda_item.profit = None
+
+
+def _aplicar_alocacoes(
+    db: Session,
+    venda_item: models.VendaItem,
+    plano: List[Tuple[models.StockLot, int]],
+    data: str,
+) -> None:
+    """Executa o plano de alocação: reduz o saldo dos lotes, cria os registros
+    de StockAllocation (anexados à *coleção* do item — mantém
+    `venda_item.allocations` correto em memória sem precisar de refresh) e
+    recalcula o status/custo/lucro do item."""
+    alocado_agora = 0
+    for lot, consumida in plano:
+        lot.quantity_remaining -= consumida
+        venda_item.allocations.append(models.StockAllocation(
+            stock_lot_id=lot.id,
+            quantity=consumida,
+            unit_cost=lot.unit_cost,
+            date=data,
+        ))
+        alocado_agora += consumida
+
+    venda_item.quantity_allocated += alocado_agora
+    _recalcular_item(venda_item)
 
 
 @router.get("", response_model=List[schemas.VendaOut])
@@ -126,14 +132,10 @@ def registrar_venda(payload: schemas.VendaCreate, db: Session = Depends(get_db))
 
             product = db.query(models.Product).filter(models.Product.id == item_in.product_id).first()
             if product:
-                # Estoque continua podendo ficar negativo — é o sinal de "venda sob
-                # encomenda" que o app já usava, sem mudança nesse comportamento.
                 product.stock -= item_in.quantity
 
                 plano = _allocate_from_lots(db, product, item_in.quantity)
                 _aplicar_alocacoes(db, venda_item, plano, payload.date)
-            # Se o produto não existe mais (não deveria acontecer), o item fica
-            # como PENDENTE — nunca inventamos custo.
 
         if not payload.is_paid and payload.client_id:
             client = db.query(models.Client).filter(models.Client.id == payload.client_id).first()

@@ -1,9 +1,7 @@
-import os
-import uuid
 from datetime import date
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, security
@@ -14,12 +12,6 @@ router = APIRouter(
     tags=["Produtos"],
     dependencies=[Depends(security.get_current_user)],
 )
-
-UPLOAD_DIR = os.path.join("uploads", "products")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-MAX_IMAGE_SIZE_MB = 5
 
 
 @router.get("", response_model=List[schemas.ProductOut])
@@ -36,6 +28,9 @@ def create_product(payload: schemas.ProductCreate, db: Session = Depends(get_db)
     db.add(product)
     db.flush()
 
+    # Se já nasce com estoque, cria um lote PEPS pra esse estoque inicial
+    # poder ser consumido corretamente nas vendas. Esse é o ÚNICO lugar (além
+    # de Entradas) onde estoque é definido a partir daqui pra frente.
     if product.stock > 0:
         db.add(models.StockLot(
             product_id=product.id,
@@ -65,9 +60,18 @@ def update_product(product_id: int, payload: schemas.ProductUpdate, db: Session 
     if duplicate:
         raise HTTPException(status_code=409, detail="Já existe outro produto com esse SKU.")
 
-    # payload não inclui image_url — a foto é gerenciada só pelos endpoints
-    # de upload/remoção abaixo, então editar aqui nunca apaga a foto por acidente.
-    for field, value in payload.model_dump().items():
+    # ESTOQUE NUNCA É ALTERADO POR AQUI, de propósito — mesmo que o payload
+    # traga um valor diferente. `product.stock` tem que ficar sempre em
+    # sincronia com o saldo somado dos StockLot (é isso que sustenta o custo
+    # PEPS e a venda sob encomenda). Só existem dois jeitos legítimos de mudar
+    # estoque depois que o produto já existe:
+    #   - pra cima: registrar uma Entrada (exige custo, cria lote de verdade)
+    #   - pra baixo: uma Venda (ou, futuramente, um ajuste de perda/quebra)
+    # Editar aqui serve só pra nome, SKU e preços.
+    dados = payload.model_dump()
+    dados.pop("stock", None)
+
+    for field, value in dados.items():
         setattr(product, field, value)
 
     db.commit()
@@ -94,66 +98,8 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
             ),
         )
 
-    _remove_image_file(product.image_url)
+    # Produto nunca usado: pode ter um lote de estoque inicial órfão, apaga junto.
     db.query(models.StockLot).filter(models.StockLot.product_id == product_id).delete()
 
     db.delete(product)
     db.commit()
-
-
-def _remove_image_file(image_url: str | None) -> None:
-    """Apaga o arquivo de imagem do disco, se existir. Nunca deixa um erro de
-    arquivo travar a operação principal (produto continua sendo salvo/apagado
-    mesmo que a limpeza do arquivo antigo falhe por algum motivo)."""
-    if not image_url:
-        return
-    filepath = image_url.lstrip("/")  # "/uploads/products/x.jpg" -> "uploads/products/x.jpg"
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-    except OSError:
-        pass
-
-
-@router.post("/{product_id}/imagem", response_model=schemas.ProductOut)
-async def upload_product_image(
-    product_id: int,
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-):
-    product = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado.")
-
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Envie uma imagem JPG, PNG ou WEBP.")
-
-    contents = await file.read()
-    if len(contents) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(status_code=400, detail=f"Imagem muito grande (máximo {MAX_IMAGE_SIZE_MB}MB).")
-
-    _remove_image_file(product.image_url)
-
-    filename = f"{product_id}-{uuid.uuid4().hex[:8]}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
-    with open(filepath, "wb") as f:
-        f.write(contents)
-
-    product.image_url = f"/uploads/products/{filename}"
-    db.commit()
-    db.refresh(product)
-    return product
-
-
-@router.delete("/{product_id}/imagem", response_model=schemas.ProductOut)
-def remove_product_image(product_id: int, db: Session = Depends(get_db)):
-    product = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Produto não encontrado.")
-
-    _remove_image_file(product.image_url)
-    product.image_url = None
-    db.commit()
-    db.refresh(product)
-    return product

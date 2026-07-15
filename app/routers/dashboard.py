@@ -290,3 +290,107 @@ def get_profit_series(
         )
         for label in labels
     ]
+
+
+@router.get("/estoque-valor", response_model=schemas.EstoqueValorOut)
+def get_estoque_valor(db: Session = Depends(get_db)):
+    """Quanto de capital está parado em mercadoria agora, e quantas unidades
+    dá pra vender hoje. Usa os lotes PEPS (não a média/produto), pra refletir
+    o custo real, não uma estimativa."""
+    produtos = db.query(models.Product).all()
+    unidades_em_estoque = sum(max(p.stock, 0) for p in produtos)
+
+    lotes_com_saldo = db.query(models.StockLot).filter(models.StockLot.quantity_remaining > 0).all()
+    valor_investido = sum(lote.quantity_remaining * lote.unit_cost for lote in lotes_com_saldo)
+
+    return schemas.EstoqueValorOut(
+        unidades_em_estoque=unidades_em_estoque,
+        valor_investido=round(valor_investido, 2),
+    )
+
+
+@router.get("/aguardando-reposicao", response_model=List[schemas.AguardandoReposicaoOut])
+def get_aguardando_reposicao(db: Session = Depends(get_db)):
+    """Produtos que já foram vendidos mas ainda não têm estoque de verdade
+    cobrindo a venda (cost_status PENDENTE ou PARCIAL) — ou seja, o que
+    precisa ser comprado com prioridade pra poder entregar/fechar a conta."""
+    itens = (
+        db.query(models.VendaItem)
+        .join(models.Venda)
+        .filter(models.VendaItem.cost_status != "COMPLETO")
+        .all()
+    )
+
+    agregados: dict = {}
+    for item in itens:
+        faltante = item.quantity - item.quantity_allocated
+        if faltante <= 0:
+            continue
+        info = agregados.setdefault(
+            item.product_id, {"name": item.product_name, "qtd": 0, "clientes": set()}
+        )
+        info["qtd"] += faltante
+        info["clientes"].add(item.venda.client_name)
+
+    resultado = [
+        schemas.AguardandoReposicaoOut(
+            product_id=pid,
+            product_name=info["name"],
+            quantidade_pendente=info["qtd"],
+            clientes=sorted(info["clientes"]),
+        )
+        for pid, info in agregados.items()
+    ]
+    resultado.sort(key=lambda r: r.quantidade_pendente, reverse=True)
+    return resultado
+
+
+@router.get("/formas-pagamento", response_model=List[schemas.FormaPagamentoOut])
+def get_formas_pagamento(
+    preset: Optional[str] = Query(None, description="today|7d|30d|this_week|last_week|this_month|last_month"),
+    start: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    start_date, end_date = _resolve_period(preset, start, end)
+
+    vendas = (
+        db.query(models.Venda)
+        .filter(models.Venda.date >= start_date, models.Venda.date <= end_date)
+        .all()
+    )
+
+    agregados: dict = {}
+    for v in vendas:
+        # Venda fiada não tem forma de pagamento de verdade — agrupa como "FIADO"
+        metodo = v.payment_method if (v.is_paid and v.payment_method) else "FIADO"
+        info = agregados.setdefault(metodo, {"total": 0.0, "count": 0})
+        info["total"] += v.total_value
+        info["count"] += 1
+
+    return [
+        schemas.FormaPagamentoOut(metodo=m, total=round(i["total"], 2), quantidade=i["count"])
+        for m, i in agregados.items()
+    ]
+
+
+@router.get("/estoque-por-produto", response_model=List[schemas.EstoquePorProdutoOut])
+def get_estoque_por_produto(db: Session = Depends(get_db)):
+    """Distribuição do capital investido em estoque entre os produtos —
+    baseado no saldo real dos lotes PEPS, não numa média."""
+    lotes = db.query(models.StockLot).filter(models.StockLot.quantity_remaining > 0).all()
+    produtos = {p.id: p for p in db.query(models.Product).all()}
+
+    agregados: dict = {}
+    for lote in lotes:
+        produto = produtos.get(lote.product_id)
+        nome = produto.name if produto else f"Produto #{lote.product_id}"
+        agregados[nome] = agregados.get(nome, 0.0) + lote.quantity_remaining * lote.unit_cost
+
+    resultado = [
+        schemas.EstoquePorProdutoOut(product_name=nome, valor=round(valor, 2))
+        for nome, valor in agregados.items()
+        if valor > 0
+    ]
+    resultado.sort(key=lambda r: r.valor, reverse=True)
+    return resultado

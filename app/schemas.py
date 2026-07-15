@@ -80,7 +80,8 @@ class EntradaOut(CamelModel):
     quantity: int
     unit_cost: float
     total_cost: float
-    pode_editar: bool
+    quantidade_minima: int  # menor quantidade permitida ao editar (já consumida desse lote)
+    pode_excluir: bool      # só true se nada desse lote foi vendido/alocado ainda
 
 
 # ---------------- Clientes / Dívidas ----------------
@@ -249,3 +250,26 @@ class TopProdutoOut(CamelModel):
     quantidade_vendida: int
     faturamento: float
     lucro: float
+
+
+class EstoqueValorOut(CamelModel):
+    unidades_em_estoque: int
+    valor_investido: float
+
+
+class AguardandoReposicaoOut(CamelModel):
+    product_id: int
+    product_name: str
+    quantidade_pendente: int
+    clientes: List[str]
+
+
+class FormaPagamentoOut(CamelModel):
+    metodo: str  # "PIX" | "DINHEIRO" | "CARTAO" | "FIADO"
+    total: float
+    quantidade: int
+
+
+class EstoquePorProdutoOut(CamelModel):
+    product_name: str
+    valor: float
